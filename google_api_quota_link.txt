@@ -1,3 +1,0 @@
-
-
-https://console.cloud.google.com/iam-admin/quotas?referrer=search&inv=1&invt=AbnjMg&project=blueskytranslator
