@@ -35,24 +35,39 @@ list_rkey = '3lg424mfsl42l'
 
 #(python) list to hold the users from the (bluesky) list
 users_list = []
+number_of_accounts = 0
 
-#build the list url
-list_url = 'at://did:plc:' + list_owner_DID + '/app.bsky.graph.list/' + list_rkey
-#build the query url, which includes the list URL
-full_api_request_url = 'https://public.api.bsky.app/xrpc/app.bsky.graph.getList?list=' + list_url
 
-print(full_api_request_url)
+def get_usernames():
+    global number_of_accounts
+    #build the list url
+    list_url = 'at://did:plc:' + list_owner_DID + '/app.bsky.graph.list/' + list_rkey
+    #build the query url, which includes the list URL
+    full_api_request_url = 'https://public.api.bsky.app/xrpc/app.bsky.graph.getList?list=' + list_url
 
-#get the json about the list
-list_payload = requests.get(full_api_request_url)
+    print(full_api_request_url)
 
-#parse the json 
-list_json = json.loads(list_payload.text)
+    #get the json about the list
+    list_payload = requests.get(full_api_request_url)
 
-#grab all of the usernames and put them in users_list
-for i in list_json['items']:
-    print(f"getting {i['subject']['handle']}")
-    users_list.append(i['subject']['handle'])
+    #parse the json 
+    list_json = json.loads(list_payload.text)
+
+    if len(list_json['items']) != number_of_accounts:
+        #reset users_list
+        global users_list 
+        users_list = []
+        print('*new accounts in the list - rebuilding*')
+        #grab all of the usernames and put them in users_list
+        for i in list_json['items']:
+            print(f"getting {i['subject']['handle']}")
+            users_list.append(i['subject']['handle'])
+        #create the objects
+        populate_user_holder()
+        #update number_of_accounts
+        number_of_accounts = len(list_json['items'])
+    else:
+        print("no new accounts in list")
 
 
 
@@ -102,18 +117,23 @@ class User:
 
 
 #populates the user_holder, setting last_post_time as the moment you started the script
-for i in users_list:
-    #last_post_time = datetime.now()
-    last_post_time = datetime.now(pytz.UTC)
-    rss_url = get_rss_link_from_username(i)
-    target_profile_url = get_target_profile_url(i)
-    user_DID = get_DID_from_target_rss_url(rss_url)
+def populate_user_holder():
+    #reset the holder every time you run this so you don't get doubles
+    global user_holder
+    user_holder = []
+    for i in users_list:
+        #last_post_time = datetime.now()
+        last_post_time = datetime.now(pytz.UTC)
+        rss_url = get_rss_link_from_username(i)
+        target_profile_url = get_target_profile_url(i)
+        user_DID = get_DID_from_target_rss_url(rss_url)
 
-    user_holder.append(User(i, last_post_time, rss_url, target_profile_url, user_DID))
-    #this is just a better way to confirm things are working at startup
-    print(f'created object for {i}')
+        user_holder.append(User(i, last_post_time, rss_url, target_profile_url, user_DID))
+        #this is just a better way to confirm things are working at startup
+        print(f'created object for {i}')
 
-
+get_usernames()
+#populate_user_holder()
 
 ######GET THE FEED CONTENT, TRANSLATE, AND SEND#########
 
@@ -382,5 +402,7 @@ while True:
     print(f'loop_counter is now {loop_counter}')
     print(f'change_counter is now {change_counter}')
     print('+++++++++')
+    #check to see if the list has changed
+    get_usernames()
     time.sleep(120)
 
