@@ -242,7 +242,8 @@ def send_tweet(tweeter_username, translated_tweet_text):
                     target_text_builder.tag(value, handle)
                 elif key == 'url':
                     #print(value)
-                    target_text_builder.link(value, value)
+                    #target_text_builder.link(value, value)
+                    target_text_builder.link('link', value)
                 else:
                     print("error building rich tweet: " + key + " " + value)
   
