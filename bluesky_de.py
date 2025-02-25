@@ -8,6 +8,7 @@ from datetime import datetime
 import pytz
 import time
 import traceback
+import uuid
 
 #this is the local secrets file
 import secrets
@@ -30,6 +31,30 @@ list_owner_DID = 'ijife7e4twbh2bnrybnsgpwb'
 list_rkey = '3lg424mfsl42l'
 
 
+#######AZURE TRANSLATE SETUP STUFF######
+
+azure_key = secrets.azure_key
+azure_endpoint = secrets.azure_endpoint
+
+azure_path = '/translate'
+azure_constructed_url = azure_endpoint + azure_path
+
+azure_params = {
+    'api-version': '3.0',
+    'from': 'de',
+    'to': 'en'
+}
+
+azure_headers = {
+    'Ocp-Apim-Subscription-Key': azure_key,
+    'Ocp-Apim-Subscription-Region': secrets.azure_location,
+    'Content-type': 'application/json',
+    'X-ClientTraceId': str(uuid.uuid4())
+}
+
+########################################
+
+
 
 #######GET ALL OF THE USERS###########
 
@@ -45,7 +70,7 @@ def get_usernames():
     #build the query url, which includes the list URL
     full_api_request_url = 'https://public.api.bsky.app/xrpc/app.bsky.graph.getList?list=' + list_url
 
-    print(full_api_request_url)
+    #print(full_api_request_url)
 
     #get the json about the list
     list_payload = requests.get(full_api_request_url)
@@ -158,18 +183,48 @@ def translate_tweet_text(tweet_text):
         translated_text = translation_payload_text_json['data']['translations'][0]['translatedText']
         #re-insert the hashtag
         #uncleaned_translated_text = translated_text.replace('-h-', "#")
+        #'uncleaned' in the sense that you cleaned it to send to translation, and you are undoing that process here. So 'uncleaned' not 'unclean'
         uncleaned_translated_text = (
             translated_text
                 .replace('-h-', '#')
                 .replace('&#39;', "'")
                 .replace('&quot;', '"')
         )
+        print('translated with google')
     except:
-        print(f'problem with translating text from {translation_payload_text_json}')
-        # error_post_text = "error: problem translating text"
-        # client.login(user_name, password)
-        # post = client.send_post(error_post_text)
-        uncleaned_translated_text = 'translation error'
+        try:
+            def azure_translate(input_text):
+                #empty json to hold the text to be translated
+                body = [{}]
+                #put the input text in the json
+                body[0]['text'] = input_text
+                #send the payload to be translated
+                request = requests.post(azure_constructed_url, params=azure_params, headers=azure_headers, json=body)
+                #get the response
+                response = request.json()
+                #parse the response
+                translated_text = response[0]['translations'][0]['text']
+                #return the response
+                return(translated_text)
+            #run the function to get the translated text from azure
+            translated_text = azure_translate(cleaned_tweet_text)
+            #'un'clean it by fixing the characters 
+            uncleaned_translated_text = (
+                translated_text
+                    .replace('-h-', '#')
+                    .replace('&#39;', "'")
+                    .replace('&quot;', '"')
+            )
+            print('translated with azure')
+
+        
+        
+        except:
+            print(f'problem with translating text from {translation_payload_text_json}')
+            # error_post_text = "error: problem translating text"
+            # client.login(user_name, password)
+            # post = client.send_post(error_post_text)
+            uncleaned_translated_text = 'translation error'
 
 
     return(uncleaned_translated_text)
@@ -373,21 +428,27 @@ while True:
             try:
                 translated_tweet_text = translate_tweet_text(target_feed.entries[0].summary)
             except:
-                translate_tweet_text = "error translating tweet"
+                #translate_tweet_text = "error translating tweet"
+                translated_tweet_text = "error translating tweet"
 
             #build the tweet
 
-            #login to bluesky
-            client.login(user_name, password)
+            try:
+                #login to bluesky
+                client.login(user_name, password)
 
-            #send the tweet
-            send_tweet(i.user_name, translated_tweet_text)
+                #send the tweet
+                send_tweet(i.user_name, translated_tweet_text)
 
 
-            #reset things
-            i.last_post_time = time_of_last_tweet_dt
-            print('updated last_post_time!')
-            change_counter += 1
+                #reset things
+                i.last_post_time = time_of_last_tweet_dt
+                print('updated last_post_time!')
+                change_counter += 1
+            except Exception as e:
+                print('problem logging in to bluesky')
+                print(e)
+                change_counter += 1
 
         else:
             #print(f'New post by {i.user_name} is OLD')
