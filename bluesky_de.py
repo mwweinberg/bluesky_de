@@ -113,7 +113,13 @@ def get_rss_link_from_username(username):
     target_rss_url_full = soup.find('link', rel='alternate', type='application/rss+xml')
 
     #strip out the html around the url itself
-    target_rss_url = target_rss_url_full['href']
+    try:
+        target_rss_url = target_rss_url_full['href']
+    #for unknown reasons, some pages do not have the rss feed
+    #this exception throws an error that is then used to skip creating the object in the populate_user_holder() function
+    except:
+        target_rss_url = 'error'
+        print("error getting rss from url")
     return(target_rss_url)
 
 def get_target_profile_url(username):
@@ -149,13 +155,19 @@ def populate_user_holder():
     for i in users_list:
         #last_post_time = datetime.now()
         last_post_time = datetime.now(pytz.UTC)
+
         rss_url = get_rss_link_from_username(i)
         target_profile_url = get_target_profile_url(i)
         user_DID = get_DID_from_target_rss_url(rss_url)
 
-        user_holder.append(User(i, last_post_time, rss_url, target_profile_url, user_DID))
-        #this is just a better way to confirm things are working at startup
-        print(f'created object for {i}')
+        #some pages don't have RSS links (don't know why). If that's the case, get_rss_link_from_username() will return 'error' as the rss_url. This if/else statement uses that error message to skip creating an object for that account
+        if rss_url == 'error':
+            print("did not create object for " +i)
+        else:
+
+            user_holder.append(User(i, last_post_time, rss_url, target_profile_url, user_DID))
+            #this is just a better way to confirm things are working at startup
+            print(f'created object for {i}')
 
 get_usernames()
 #populate_user_holder()
@@ -399,6 +411,7 @@ change_counter = 0
 
 while True:
     for i in user_holder:
+        #IF YOU ARE STILL GETTING ERRORS, TRY 'IF FEED PARSER FAILS, REMOVE ACCOUNT FROM OBJECT LIST'?
         #get the feed url
         target_feed = feedparser.parse(i.rss_url)
         #load last_post_time from the object
