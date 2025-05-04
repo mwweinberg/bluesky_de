@@ -249,7 +249,9 @@ def send_tweet(tweeter_username, translated_tweet_text):
         #this is the chatGPT one that did not work
         #url_pattern = r'https?://[^\s]+(?:[^\w\s]|$)'  # Match URL, but stop before punctuation like ".", ",", etc.
         #this is the stack overflow one that did
-        url_pattern = r'(http|ftp|https):\/\/([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-])'
+        #url_pattern = r'(http|ftp|https):\/\/([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-])'
+        url_pattern = r'(http|ftp|https):\/\/([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-!])'
+
         mention_pattern = r'@\w+(\.\w+)*'
         
         
@@ -356,6 +358,7 @@ def send_tweet(tweeter_username, translated_tweet_text):
             text_builder_second_half = client_utils.TextBuilder()
             text_builder_second_half.link(tweeter_username, get_target_profile_url(tweeter_username))
             text_builder_second_half.text(' (2/2): ')
+            text_builder_second_half.link(' Orig.', target_feed.entries[0].link)
             print('*text_builder first and second half exist')
             #cut translated_tweet_text in half
             #take a tweet, find a space in the middle, and break it in two
