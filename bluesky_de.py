@@ -161,8 +161,11 @@ def populate_user_holder():
         user_DID = get_DID_from_target_rss_url(rss_url)
 
         #some pages don't have RSS links (don't know why). If that's the case, get_rss_link_from_username() will return 'error' as the rss_url. This if/else statement uses that error message to skip creating an object for that account
+        #also some pages have a link but it returns a 403. That's what the elif is for
         if rss_url == 'error':
-            print("did not create object for " +i)
+            print("did not create object for " +i + " because the link did not exist")
+        elif feedparser.parse(rss_url).status == 403:
+            print("did not create object for " +i + " because the link threw a 403 error")
         else:
 
             user_holder.append(User(i, last_post_time, rss_url, target_profile_url, user_DID))

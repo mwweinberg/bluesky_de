@@ -15,7 +15,7 @@ translation_api_key = secrets.translation_api_key
 ####GET THE RSS LINK########
 
 #username being targeted
-target_username = 'rbb24.de'
+target_username = 'tagesschau.bsky.social'
 
 #construct the profile page url
 target_profile_url = 'https://bsky.app/profile/' + target_username
@@ -45,6 +45,10 @@ print(target_DID)
 #use the rss url to get the rss feed
 target_feed = feedparser.parse(target_rss_url)
 
+#check to see if there is a 403 error
+print(target_feed.status)
+print(feedparser.parse(target_rss_url).status)
+
 #get the most recent entry
 #author of the tweet
 print(target_username)
@@ -58,18 +62,18 @@ print(target_feed.entries[0].published)
 target_tweet_link = target_feed.entries[0].link
 target_tweet_text = target_feed.entries[0].summary
 
-## for troubleshooting translation issues - added much later
+####### for troubleshooting translation issues - added much later
 
-tweet_text_0 = target_feed.entries[0].summary
-tweet_text_1 = target_feed.entries[3].summary
+# tweet_text_0 = target_feed.entries[0].summary
+# tweet_text_1 = target_feed.entries[3].summary
 
-print(f'tweet_text_0: {tweet_text_0}')
-print('**************')
-print(f'tweet_text_1: {tweet_text_1}')
-print('+++++++++++++++++++')
+# print(f'tweet_text_0: {tweet_text_0}')
+# print('**************')
+# print(f'tweet_text_1: {tweet_text_1}')
+# print('+++++++++++++++++++')
 
-cleaned_tweet = tweet_text_1.replace('#', '-h-')
-print(f'cleaned tweet: {cleaned_tweet}')
+# cleaned_tweet = tweet_text_1.replace('#', '-h-')
+# print(f'cleaned tweet: {cleaned_tweet}')
 
 # broken_tweet = tweet_text_0.split('http', 1)
 # broken_tweet[1] = 'http' + broken_tweet[1]
