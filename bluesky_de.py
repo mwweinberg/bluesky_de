@@ -415,73 +415,82 @@ change_counter = 0
 
 
 while True:
-    for i in user_holder:
-        #IF YOU ARE STILL GETTING ERRORS, TRY 'IF FEED PARSER FAILS, REMOVE ACCOUNT FROM OBJECT LIST'?
-        #get the feed url
-        target_feed = feedparser.parse(i.rss_url)
-        #load last_post_time from the object
-        last_post_time = i.last_post_time
-        #load time_of_last_tweet from the first object in the RSS feed
-        try:
-            time_of_last_tweet = target_feed.entries[0].published
-            #converted from string to datetime object
-            time_of_last_tweet_dt = datetime.strptime(time_of_last_tweet, "%d %b %Y %H:%M %z")
-        except:
-            print(f'error with time of last tweet from {target_feed}')
-            time_of_last_tweet_dt = datetime.now(pytz.UTC)
-
-        #see if the latest tweet is newer than last_post_time
-        if time_of_last_tweet_dt > last_post_time:
-            print(f'New post by {i.user_name} is NEW')
-            print(time_of_last_tweet_dt)
-            print(last_post_time)
-            time_diff = time_of_last_tweet_dt - last_post_time
-            minutes_diff = time_diff.total_seconds() / 60
-            print(f'time between times is {minutes_diff}')
-            #if it is, update the last post time (you'll also trigger a bunch of other stuff)
-
-            #This is the stuff
-            
-            #send the text of the new tweet to be translated
+    try:
+        for i in user_holder:
+            #IF YOU ARE STILL GETTING ERRORS, TRY 'IF FEED PARSER FAILS, REMOVE ACCOUNT FROM OBJECT LIST'?
+            #get the feed url
+            target_feed = feedparser.parse(i.rss_url)
+            #load last_post_time from the object
+            last_post_time = i.last_post_time
+            #load time_of_last_tweet from the first object in the RSS feed
             try:
-                translated_tweet_text = translate_tweet_text(target_feed.entries[0].summary)
+                time_of_last_tweet = target_feed.entries[0].published
+                #converted from string to datetime object
+                time_of_last_tweet_dt = datetime.strptime(time_of_last_tweet, "%d %b %Y %H:%M %z")
             except:
-                #translate_tweet_text = "error translating tweet"
-                translated_tweet_text = "error translating tweet"
+                print(f'error with time of last tweet from {target_feed}')
+                time_of_last_tweet_dt = datetime.now(pytz.UTC)
 
-            #build the tweet
+            #see if the latest tweet is newer than last_post_time
+            if time_of_last_tweet_dt > last_post_time:
+                print(f'New post by {i.user_name} is NEW')
+                print(time_of_last_tweet_dt)
+                print(last_post_time)
+                time_diff = time_of_last_tweet_dt - last_post_time
+                minutes_diff = time_diff.total_seconds() / 60
+                print(f'time between times is {minutes_diff}')
+                #if it is, update the last post time (you'll also trigger a bunch of other stuff)
 
-            try:
-                #login to bluesky
-                client.login(user_name, password)
+                #This is the stuff
 
-                #send the tweet
-                send_tweet(i.user_name, translated_tweet_text)
+                #send the text of the new tweet to be translated
+                try:
+                    translated_tweet_text = translate_tweet_text(target_feed.entries[0].summary)
+                except:
+                    #translate_tweet_text = "error translating tweet"
+                    translated_tweet_text = "error translating tweet"
 
+                #build the tweet
 
-                #reset things
-                i.last_post_time = time_of_last_tweet_dt
-                print('updated last_post_time!')
-                change_counter += 1
-            except Exception as e:
-                print('problem logging in to bluesky')
-                print(e)
-                change_counter += 1
+                try:
+                    #login to bluesky
+                    client.login(user_name, password)
 
-        else:
-            #print(f'New post by {i.user_name} is OLD')
-            #print(f'last_post_time is {last_post_time}')
-            #print(f'time_of_last_tweet_dt is {time_of_last_tweet_dt}')
-            pass
+                    #send the tweet
+                    send_tweet(i.user_name, translated_tweet_text)
 
 
-        
-    loop_counter += 1
-    print('+++++++++')
-    print(f'loop_counter is now {loop_counter}')
-    print(f'change_counter is now {change_counter}')
-    print('+++++++++')
-    #check to see if the list has changed
-    get_usernames()
-    time.sleep(120)
+                    #reset things
+                    i.last_post_time = time_of_last_tweet_dt
+                    print('updated last_post_time!')
+                    change_counter += 1
+                except Exception as e:
+                    print('problem logging in to bluesky')
+                    print(e)
+                    change_counter += 1
+
+            else:
+                #print(f'New post by {i.user_name} is OLD')
+                #print(f'last_post_time is {last_post_time}')
+                #print(f'time_of_last_tweet_dt is {time_of_last_tweet_dt}')
+                pass
+
+
+
+        loop_counter += 1
+        print('+++++++++')
+        print(f'loop_counter is now {loop_counter}')
+        print(f'change_counter is now {change_counter}')
+        print('+++++++++')
+        #check to see if the list has changed
+        get_usernames()
+        time.sleep(120)
+
+    except ConnectionResetError as e:
+        print(f'Connection reset by server, sleeping 30s and retrying: {e}')
+        time.sleep(30)
+    except Exception as e:
+        print(f'Unexpected error in main loop: {e}')
+        print(traceback.format_exc())
+        time.sleep(30)
 
