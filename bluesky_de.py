@@ -1,496 +1,609 @@
-import requests 
-from bs4 import BeautifulSoup
-import feedparser
+"""Translate posts from a Bluesky list of German-language accounts and repost them in English.
+
+The big picture, once per cycle (every POLL_SECONDS):
+  1. read the members of the bluesky list (sync_accounts)
+  2. for each member, pull their recent feed with getAuthorFeed (process_account)
+  3. anything new (posts AND reposts) gets translated - google first, azure as
+     the fallback, source language auto-detected
+  4. the translation is posted to this account, with the original post embedded
+     as a quote so images, video, link cards, and quoted posts all carry over
+
+State (the login session plus recently-posted URIs per account) persists in
+state.json next to this file, so a restart neither drops nor duplicates posts.
+A post is only marked as done after it successfully sends: if anything fails
+mid-process, the post is retried on the next cycle. In other words, when
+something goes wrong the bot prefers a rare duplicate over a silent drop.
+"""
+
 import json
-from atproto import Client, client_utils
-import re 
-from datetime import datetime
-import pytz
+import logging
+import re
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from atproto import Client, client_utils, models
+from atproto_client.exceptions import BadRequestError, UnauthorizedError
 
 #this is the local secrets file
 import secrets
 
-#translation variables
-language_to_translate_to = 'en'
-translation_api_key = secrets.translation_api_key
+#---------------- configuration ----------------
 
-#bluesky credentials
-#create the object
-client = Client()
-#credential variables are used below
-user_name = secrets.user_name
-password = secrets.password
+#the language everything gets translated INTO. the source language is
+#auto-detected per post, because reposts are not always german
+TARGET_LANGUAGE = 'en'
 
-###variables for the list of users you will pull from 
+###variables for the list of users you will pull from
 #DID is in the middle of the list URL
-list_owner_DID = 'ijife7e4twbh2bnrybnsgpwb'
+LIST_OWNER_DID = 'did:plc:ijife7e4twbh2bnrybnsgpwb'
 #rkey is at the end of the list url
-list_rkey = '3lg424mfsl42l'
+LIST_RKEY = '3lg424mfsl42l'
+
+#how long to wait between cycles
+POLL_SECONDS = 120
+#max posts per account per cycle; anything older than that is skipped so an
+#outage can't flood the account with a big backlog
+BACKLOG_CAP = 2
+#how many already-posted URIs to remember per account. this is the rolling
+#dedupe window, and it also keeps the state file from growing forever
+SEEN_URIS_KEPT = 25
+#posts pulled per account per cycle (must be comfortably > BACKLOG_CAP)
+FEED_FETCH_LIMIT = 10
+#bluesky hard limit on post length
+MAX_POST_CHARS = 300
+#timeout for the translation API calls so a network hang can't freeze the bot
+REQUEST_TIMEOUT = 30
+#goes between the reposter and the original author in the header,
+#e.g. "zeit.de ↻ tagesschau.de: ..."
+REPOST_MARKER = ' ↻ '
+#marks the translation of a quoted post, e.g. "❝ tagesschau.de: ..."
+#(sent as a reply underneath the main translation)
+QUOTE_MARKER = '❝ '
+
+#the state file lives next to this script, wherever the script is
+STATE_FILE = Path(__file__).resolve().parent / 'state.json'
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
+#the atproto library logs every HTTP request at INFO, which drowns out the journal
+logging.getLogger('httpx').setLevel(logging.WARNING)
+log = logging.getLogger('bluesky_de')
 
 
-#######AZURE TRANSLATE SETUP STUFF######
+#---------------- persistent state ----------------
+#state is one dict, saved to state.json, shaped like this:
+#{
+#  "session": "<the bluesky login session, so restarts don't need a password login>",
+#  "accounts": {
+#    "did:plc:xyz...": {
+#      "handle": "tagesschau.de",
+#      "floor": "2026-07-02T12:00:00+00:00",   <- only activity newer than this counts
+#      "seen_uris": ["at://.../post/abc", ...] <- recently posted, for dedupe
+#    },
+#    ...one entry per member of the bluesky list
+#  }
+#}
 
-azure_key = secrets.azure_key
-azure_endpoint = secrets.azure_endpoint
-
-azure_path = '/translate'
-azure_constructed_url = azure_endpoint + azure_path
-
-azure_params = {
-    'api-version': '3.0',
-    'from': 'de',
-    'to': 'en'
-}
-
-azure_headers = {
-    'Ocp-Apim-Subscription-Key': azure_key,
-    'Ocp-Apim-Subscription-Region': secrets.azure_location,
-    'Content-type': 'application/json',
-    'X-ClientTraceId': str(uuid.uuid4())
-}
-
-########################################
-
-
-
-#######GET ALL OF THE USERS###########
-
-#(python) list to hold the users from the (bluesky) list
-users_list = []
-number_of_accounts = 0
-
-
-def get_usernames():
-    global number_of_accounts
-    #build the list url
-    list_url = 'at://did:plc:' + list_owner_DID + '/app.bsky.graph.list/' + list_rkey
-    #build the query url, which includes the list URL
-    full_api_request_url = 'https://public.api.bsky.app/xrpc/app.bsky.graph.getList?list=' + list_url
-
-    #print(full_api_request_url)
-
-    #get the json about the list
-    list_payload = requests.get(full_api_request_url)
-
-    #parse the json 
-    list_json = json.loads(list_payload.text)
-
-    if len(list_json['items']) != number_of_accounts:
-        #reset users_list
-        global users_list 
-        users_list = []
-        print('*new accounts in the list - rebuilding*')
-        #grab all of the usernames and put them in users_list
-        for i in list_json['items']:
-            print(f"getting {i['subject']['handle']}")
-            users_list.append(i['subject']['handle'])
-        #create the objects
-        populate_user_holder()
-        #update number_of_accounts
-        number_of_accounts = len(list_json['items'])
-    else:
-        print("no new accounts in list")
-
-
-
-####GET THE RSS LINK########
-
-def get_rss_link_from_username(username):
-    #construct the profile page url
-    #target_profile_url = 'https://bsky.app/profile/' + username
-    target_profile_url = get_target_profile_url(username)
-
-    #get the profile page
-    target_profile_page_content = requests.get(target_profile_url)
-
-    #parse the contents of the profile page
-    soup = BeautifulSoup(target_profile_page_content.text, 'html.parser')
-
-    #find the relevant link in the profile page contents
-    target_rss_url_full = soup.find('link', rel='alternate', type='application/rss+xml')
-
-    #strip out the html around the url itself
-    try:
-        target_rss_url = target_rss_url_full['href']
-    #for unknown reasons, some pages do not have the rss feed
-    #this exception throws an error that is then used to skip creating the object in the populate_user_holder() function
-    except:
-        target_rss_url = 'error'
-        print("error getting rss from url")
-    return(target_rss_url)
-
-def get_target_profile_url(username):
-    output = 'https://bsky.app/profile/' + username
-    return(output)
-
-def get_DID_from_target_rss_url(url):
-    target_DID_almost = url.replace("https://bsky.app/profile/", "")
-    target_DID = target_DID_almost.replace("/rss", "")
-    return(target_DID)
-
-
-####CREATE THE USER OBJECTS##############   
-
-# list to hold all of the Users objects you create
-user_holder = []
-
-#defines User class
-class User:
-    def __init__(self, user_name, last_post_time, rss_url, target_profile_url, DID):
-        self.user_name = user_name
-        self.last_post_time = last_post_time
-        self.rss_url = rss_url
-        self.target_profile_url = target_profile_url
-        self.DID = DID
-
-
-#populates the user_holder, setting last_post_time as the moment you started the script
-def populate_user_holder():
-    #reset the holder every time you run this so you don't get doubles
-    global user_holder
-    user_holder = []
-    for i in users_list:
-        #last_post_time = datetime.now()
-        last_post_time = datetime.now(pytz.UTC)
-
-        rss_url = get_rss_link_from_username(i)
-        target_profile_url = get_target_profile_url(i)
-        user_DID = get_DID_from_target_rss_url(rss_url)
-
-        #some pages don't have RSS links (don't know why). If that's the case, get_rss_link_from_username() will return 'error' as the rss_url. This if/else statement uses that error message to skip creating an object for that account
-        #also some pages have a link but it returns a 403. That's what the elif is for
-        if rss_url == 'error':
-            print("did not create object for " +i + " because the link did not exist")
-        elif feedparser.parse(rss_url).status == 403:
-            print("did not create object for " +i + " because the link threw a 403 error")
-        else:
-
-            user_holder.append(User(i, last_post_time, rss_url, target_profile_url, user_DID))
-            #this is just a better way to confirm things are working at startup
-            print(f'created object for {i}')
-
-get_usernames()
-#populate_user_holder()
-
-######GET THE FEED CONTENT, TRANSLATE, AND SEND#########
-
-def translate_tweet_text(tweet_text):
-
-    #sending hashtags to google translate via the url throws an error, so clean them out (you can replace it below)
-    cleaned_tweet_text = tweet_text.replace('#','-h-')
-
-    #build the translation url
-    translation_payload_url = 'https://translation.googleapis.com/language/translate/v2?q=' + cleaned_tweet_text + '&target=' + language_to_translate_to + '&key=' + translation_api_key
-
-    print(f'translation_payload_url = {translation_payload_url}')
-
-    #get the translation response from google
-    translation_payload = requests.get(translation_payload_url)
-
-    #parse the json
-    translation_payload_text_json = json.loads(translation_payload.text)
-
-    #pull out the translated text string
-    try:
-        translated_text = translation_payload_text_json['data']['translations'][0]['translatedText']
-        #re-insert the hashtag
-        #uncleaned_translated_text = translated_text.replace('-h-', "#")
-        #'uncleaned' in the sense that you cleaned it to send to translation, and you are undoing that process here. So 'uncleaned' not 'unclean'
-        uncleaned_translated_text = (
-            translated_text
-                .replace('-h-', '#')
-                .replace('&#39;', "'")
-                .replace('&quot;', '"')
-        )
-        print('translated with google')
-    except:
+def load_state():
+    #read state.json if it exists; if it's missing or unreadable, start fresh
+    if STATE_FILE.exists():
         try:
-            def azure_translate(input_text):
-                #empty json to hold the text to be translated
-                body = [{}]
-                #put the input text in the json
-                body[0]['text'] = input_text
-                #send the payload to be translated
-                request = requests.post(azure_constructed_url, params=azure_params, headers=azure_headers, json=body)
-                #get the response
-                response = request.json()
-                #parse the response
-                translated_text = response[0]['translations'][0]['text']
-                #return the response
-                return(translated_text)
-            #run the function to get the translated text from azure
-            translated_text = azure_translate(cleaned_tweet_text)
-            #'un'clean it by fixing the characters 
-            uncleaned_translated_text = (
-                translated_text
-                    .replace('-h-', '#')
-                    .replace('&#39;', "'")
-                    .replace('&quot;', '"')
-            )
-            print('translated with azure')
-
-        
-        
-        except:
-            print(f'problem with translating text from {translation_payload_text_json}')
-            # error_post_text = "error: problem translating text"
-            # client.login(user_name, password)
-            # post = client.send_post(error_post_text)
-            uncleaned_translated_text = 'translation error'
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning('could not read state file, starting fresh: %s', e)
+    return {'session': None, 'accounts': {}}
 
 
-    return(uncleaned_translated_text)
+def save_state():
+    #write-then-rename so a crash mid-write can't corrupt the file
+    tmp = STATE_FILE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE_FILE)
 
-def send_tweet(tweeter_username, translated_tweet_text):
 
-    #function to break up the contents of the tweet
-    def extract_components(input_string):
-        # Define regex patterns for URL and @mention
-        #this is the chatGPT one that did not work
-        #url_pattern = r'https?://[^\s]+(?:[^\w\s]|$)'  # Match URL, but stop before punctuation like ".", ",", etc.
-        #this is the stack overflow one that did
-        #url_pattern = r'(http|ftp|https):\/\/([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-])'
-        #url_pattern = r'(http|ftp|https):\/\/([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:\/~+#-]*[\w@?^=%&\/~+#-!])'
-        url_pattern = r'(http|ftp|https):\/\/([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#\-!]*[\w@?^=%&/~+#\-!])'
-        mention_pattern = r'@\w+(\.\w+)*'
-        
-        
-        # Initialize the list to store the components
-        tweet_components = []
-        
-        # Current position in the string
-        pos = 0
-        
-        while pos < len(input_string):
-            # Find the next URL or mention
-            url_match = re.search(url_pattern, input_string[pos:])
-            mention_match = re.search(mention_pattern, input_string[pos:])
-            
-            # If we found both a URL and a mention, choose the one that comes first
-            if url_match and mention_match:
-                if url_match.start() < mention_match.start():
-                    match = url_match
-                else:
-                    match = mention_match
-            elif url_match:
-                match = url_match
-            elif mention_match:
-                match = mention_match
-            else:
-                # If no match is found, the rest is text
-                tweet_components.append({'text': input_string[pos:]})
-                break
-            
-            # Extract the text before the match
-            before_match = input_string[pos:pos + match.start()]
-            if before_match:
-                tweet_components.append({'text': before_match})
-            
-            # Extract the URL or mention
-            if match == url_match:
-                # Extract the clean URL (without trailing punctuation)
-                url = match.group(0)
-                tweet_components.append({'url': url})
-                
-                # Check if there's punctuation following the URL (e.g., a period or comma)
-                next_char = input_string[pos + match.end():pos + match.end() + 1]
-                if next_char in '.!?,':
-                    # If punctuation follows, treat it as part of the next text and add it
-                    tweet_components.append({'text': next_char})
-                    pos += 1  # Move past the punctuation
-            elif match == mention_match:
-                tweet_components.append({'mention': match.group(0)})
-            
-            # Move position forward by the length of the matched part
-            pos += match.end()
-        
-        return tweet_components
+state = load_state()
 
-    #run the function to get the tweet components
-    tweet_components = extract_components(translated_tweet_text)
-    print('components extracted')
 
-    #create the object that you will fill with the contents of the tweet
-    text_builder = client_utils.TextBuilder()
+def uri_already_posted(uri):
+    #global check so the same post reposted by several list members only goes out once
+    return any(uri in account['seen_uris'] for account in state['accounts'].values())
 
-    #create the start of the tweet identifying the tweeter
-    text_builder.link(tweeter_username, get_target_profile_url(tweeter_username))
-    text_builder.text(': ')
-    print('tweet header built')
 
-    #build the body of the tweets from the components
-    ###YOU REPLACED 'text_builder' with 'target_text_builder'
-    def build_the_tweet(parsed_tweet, target_text_builder):
-        for i in parsed_tweet:
-        #for i in tweet_components:
-            for key, value in i.items():
-                if key == 'text':
-                    target_text_builder.text(value)
-                elif key == 'mention':
-                    handle = value.replace("@","")
-                    target_text_builder.tag(value, handle)
-                elif key == 'url':
-                    #print(value)
-                    #target_text_builder.link(value, value)
-                    target_text_builder.link('link', value)
-                else:
-                    print("error building rich tweet: " + key + " " + value)
-  
-    #build_the_tweet(tweet_components)
-    build_the_tweet(tweet_components, text_builder)
-    #this is new
-    text_builder.link(' Orig.', target_feed.entries[0].link)
-    print('tweet body built')
+def mark_done(account, uri, event_time):
+    #record that this post has been handled, so it never gets posted twice.
+    #called after a successful send, OR when a post is deliberately skipped
+    #by the backlog cap
+    account['seen_uris'].append(uri)
+    #keep the dedupe window (and the state file) small by dropping the oldest
+    del account['seen_uris'][:-SEEN_URIS_KEPT]
+    #move the account's floor forward so old posts age out of consideration
+    #even after their URIs rotate out of seen_uris
+    if event_time > parse_timestamp(account['floor']):
+        account['floor'] = event_time.isoformat()
 
-    #send tweet
-    try:
-        post = client.send_post(text_builder)
-        print('tweet sent')
-    except: 
-        
-        
+
+#---------------- bluesky login ----------------
+
+client = Client()
+
+
+def persist_session(event, session):
+    #called automatically by the client whenever the session is created or
+    #refreshed, so state.json always holds a session that still works
+    state['session'] = session.export()
+    save_state()
+
+
+client.on_session_change(persist_session)
+
+
+def bsky_login():
+    #reusing a saved session avoids bluesky's strict rate limit on password
+    #logins (roughly 300 per day - easy to hit if you logged in per post)
+    if state.get('session'):
         try:
-            #create text_builder first half
-            text_builder_first_half = client_utils.TextBuilder()#create the start of the tweet identifying the tweeter
-            text_builder_first_half.link(tweeter_username, get_target_profile_url(tweeter_username))
-            text_builder_first_half.text(' (1/2): ')
-            #create text_builder second half
-            text_builder_second_half = client_utils.TextBuilder()
-            text_builder_second_half.link(tweeter_username, get_target_profile_url(tweeter_username))
-            text_builder_second_half.text(' (2/2): ')
-            print('*text_builder first and second half exist')
-            #cut translated_tweet_text in half
-            #take a tweet, find a space in the middle, and break it in two
-            def one_tweet_to_two_tweets(original_tweet_text):
-                print(f'**original_tweet_text is: {original_tweet_text}')
-                #you are looking for spaces
-                split_char = ' '
-                #count how many spaces there are
-                space_count = original_tweet_text.count(split_char)
-                #pick a space in the middle
-                halfway = round(space_count/2)
-                #break the tweet up into a bunch of pieces that do not include the spaces
-                all_of_the_pieces_holder = original_tweet_text.split(split_char)
-                #create a list of the two halves by putting the pieces from one into one bucket, and the rest into the other
-                split_string_list = split_char.join(all_of_the_pieces_holder[:halfway]), split_char.join(all_of_the_pieces_holder[halfway:])
-
-                return split_string_list
-            split_tweets = one_tweet_to_two_tweets(translated_tweet_text)
-            print('-long tweet split')
-            tweet_first_half = split_tweets[0]
-            tweet_second_half = split_tweets[1]
-            tweet_first_half_components = extract_components(tweet_first_half)
-            tweet_second_half_components = extract_components(tweet_second_half)
-            print('-halves broken up in to parts')
-            build_the_tweet(tweet_first_half_components, text_builder_first_half)
-            build_the_tweet(tweet_second_half_components, text_builder_second_half)
-            print('-split tweets built')
-            post_first_half = client.send_post(text_builder_first_half)
-            post_second_half = client.send_post(text_builder_second_half)
-            print('-tweeted split tweet!')
-            
-
+            client.login(session_string=state['session'])
+            log.info('logged in with saved session')
+            return
         except Exception as e:
-            print(e)
-            print('~~~~~~~~~~~~~~~~~~~~~~~')
-            print(traceback.format_exc())
-            print(f'error in sending. translated tweet text is from {tweeter_username} and translated tweet text is: {translated_tweet_text}')
+            #the saved session can expire or be revoked; fall through to a
+            #normal password login and a fresh session gets saved after it
+            log.warning('saved session rejected (%s), doing a fresh login', e)
+            state['session'] = None
+    client.login(secrets.user_name, secrets.password)
+    log.info('logged in with a fresh session')
 
 
-            ##first_half_of_tweet_components = extract_components(first_half_of_translated_tweet_tet
-            ##build_the_tweet(first_half_of_tweet_components)
+#---------------- list membership ----------------
 
-        
-            error_post_text = "error: tried to send a long post from: " + tweeter_username
-            post = client.send_post(error_post_text)
-        
+def sync_accounts():
+    """Fetch list membership and add/remove accounts without touching the state of existing ones."""
+    #build the at:// uri of the list, then page through its members
+    #(the API returns at most 100 per request, the cursor gets the next page)
+    list_uri = f'at://{LIST_OWNER_DID}/app.bsky.graph.list/{LIST_RKEY}'
+    members = {}
+    cursor = None
+    while True:
+        response = client.app.bsky.graph.get_list({'list': list_uri, 'limit': 100, 'cursor': cursor})
+        for item in response.items:
+            members[item.subject.did] = item.subject.handle
+        cursor = response.cursor
+        if not cursor:
+            break
+
+    accounts = state['accounts']
+    #anyone on the list who isn't being tracked yet gets added.
+    #existing accounts are left alone - this is what makes adding one account
+    #to the list NOT reset the tracking state of all the others
+    for did, handle in members.items():
+        if did not in accounts:
+            log.info('list added %s, watching from now on', handle)
+            accounts[did] = {
+                'handle': handle,
+                #only activity newer than this is considered, so adding an
+                #account doesn't dump its whole recent history onto the feed
+                'floor': utcnow_iso(),
+                'seen_uris': [],
+            }
+        else:
+            #handles can change; the DID is the stable identity
+            accounts[did]['handle'] = handle
+    #anyone tracked who is no longer on the list gets dropped
+    for did in list(accounts):
+        if did not in members:
+            log.info('list removed %s, dropping its state', accounts[did]['handle'])
+            del accounts[did]
 
 
-#loop_counter is just for testing and can be deleted
-loop_counter = 0
-change_counter = 0
+#---------------- time helpers ----------------
+
+def utcnow_iso():
+    #current UTC time as a string like '2026-07-02T12:00:00+00:00'
+    #(strings are what goes into state.json, since json has no datetime type)
+    return datetime.now(timezone.utc).isoformat()
 
 
-while True:
+def parse_timestamp(raw):
+    #turn a timestamp string back into a datetime object for comparisons.
+    #createdAt is set by whatever app made the post, so be tolerant: normalize
+    #the Z suffix and trim sub-microsecond digits that fromisoformat rejects
+    cleaned = re.sub(r'\.(\d{6})\d+', r'.\1', raw.replace('Z', '+00:00'))
+    return datetime.fromisoformat(cleaned)
+
+
+#---------------- translation ----------------
+
+class TranslationError(Exception):
+    #raised only when BOTH translation services fail. the caller treats this
+    #as "try again next cycle" rather than posting broken content
+    pass
+
+
+def translate_with_google(text):
+    #google translate v2, called with proper URL parameters (the params dict)
+    #so characters like &, #, and newlines in the post can't break the request
+    response = requests.get(
+        'https://translation.googleapis.com/language/translate/v2',
+        params={
+            'q': text,
+            #no 'source': let google detect it, since reposts are not always german
+            'target': TARGET_LANGUAGE,
+            #plain-text mode: no HTML entities like &#39; in the response
+            'format': 'text',
+            'key': secrets.translation_api_key,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    payload = response.json()
+    #google puts errors (like a used-up daily quota) in the json instead of
+    #the translation - surface that as an exception so azure gets a turn
+    if 'data' not in payload:
+        raise RuntimeError(payload.get('error', {}).get('message', f'HTTP {response.status_code}'))
+    return payload['data']['translations'][0]['translatedText']
+
+
+def translate_with_azure(text):
+    #azure translator, same idea as google but the text travels in the json
+    #body of a POST instead of the URL
+    response = requests.post(
+        secrets.azure_endpoint + '/translate',
+        #no 'from': azure auto-detects the source language
+        params={'api-version': '3.0', 'to': TARGET_LANGUAGE},
+        headers={
+            'Ocp-Apim-Subscription-Key': secrets.azure_key,
+            'Ocp-Apim-Subscription-Region': secrets.azure_location,
+            'Content-type': 'application/json',
+            'X-ClientTraceId': str(uuid.uuid4()),
+        },
+        json=[{'text': text}],
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()[0]['translations'][0]['text']
+
+
+def translate(text):
+    #google first (free tier), azure as the fallback when google fails or
+    #runs out of quota for the day
     try:
-        for i in user_holder:
-            #IF YOU ARE STILL GETTING ERRORS, TRY 'IF FEED PARSER FAILS, REMOVE ACCOUNT FROM OBJECT LIST'?
-            #get the feed url
-            target_feed = feedparser.parse(i.rss_url)
-            #load last_post_time from the object
-            last_post_time = i.last_post_time
-            #load time_of_last_tweet from the first object in the RSS feed
-            try:
-                time_of_last_tweet = target_feed.entries[0].published
-                #converted from string to datetime object
-                time_of_last_tweet_dt = datetime.strptime(time_of_last_tweet, "%d %b %Y %H:%M %z")
-            except:
-                print(f'error with time of last tweet from {target_feed}')
-                time_of_last_tweet_dt = datetime.now(pytz.UTC)
-
-            #see if the latest tweet is newer than last_post_time
-            if time_of_last_tweet_dt > last_post_time:
-                print(f'New post by {i.user_name} is NEW')
-                print(time_of_last_tweet_dt)
-                print(last_post_time)
-                time_diff = time_of_last_tweet_dt - last_post_time
-                minutes_diff = time_diff.total_seconds() / 60
-                print(f'time between times is {minutes_diff}')
-                #if it is, update the last post time (you'll also trigger a bunch of other stuff)
-
-                #This is the stuff
-
-                #send the text of the new tweet to be translated
-                try:
-                    translated_tweet_text = translate_tweet_text(target_feed.entries[0].summary)
-                except:
-                    #translate_tweet_text = "error translating tweet"
-                    translated_tweet_text = "error translating tweet"
-
-                #build the tweet
-
-                try:
-                    #login to bluesky
-                    client.login(user_name, password)
-
-                    #send the tweet
-                    send_tweet(i.user_name, translated_tweet_text)
-
-
-                    #reset things
-                    i.last_post_time = time_of_last_tweet_dt
-                    print('updated last_post_time!')
-                    change_counter += 1
-                except Exception as e:
-                    print('problem logging in to bluesky')
-                    print(e)
-                    change_counter += 1
-
-            else:
-                #print(f'New post by {i.user_name} is OLD')
-                #print(f'last_post_time is {last_post_time}')
-                #print(f'time_of_last_tweet_dt is {time_of_last_tweet_dt}')
-                pass
-
-
-
-        loop_counter += 1
-        print('+++++++++')
-        print(f'loop_counter is now {loop_counter}')
-        print(f'change_counter is now {change_counter}')
-        print('+++++++++')
-        #check to see if the list has changed
-        get_usernames()
-        time.sleep(120)
-
-    except ConnectionResetError as e:
-        print(f'Connection reset by server, sleeping 30s and retrying: {e}')
-        time.sleep(30)
+        translated = translate_with_google(text)
+        log.info('translated with google')
+        return translated
     except Exception as e:
-        print(f'Unexpected error in main loop: {e}')
-        print(traceback.format_exc())
-        time.sleep(30)
+        log.warning('google translate failed (%s), trying azure', e)
+    try:
+        translated = translate_with_azure(text)
+        log.info('translated with azure')
+        return translated
+    except Exception as e:
+        raise TranslationError(f'both translation services failed: {e}') from e
 
+
+#---------------- building and sending posts ----------------
+
+#one pattern with three alternatives, used to find the pieces of a post that
+#need to become rich-text facets instead of plain text:
+#  url      - http(s):// up to the next whitespace
+#  mention  - @ followed by a handle like @dwd.bsky.social
+#  hashtag  - # followed by a word
+TOKEN_RE = re.compile(
+    r'(?P<url>https?://\S+)'
+    r'|(?P<mention>@\w+(?:\.\w+)*)'
+    r'|(?P<hashtag>#\w+)'
+)
+
+
+def extract_components(text):
+    """Split text into ('text'|'url'|'mention'|'hashtag', value) pieces."""
+    #walks through the text finding urls/mentions/hashtags, and keeps the
+    #plain text between them as its own pieces, in order. example:
+    #  'Neu: https://taz.de siehe #Wetter'
+    #becomes
+    #  [('text', 'Neu: '), ('url', 'https://taz.de'), ('text', ' siehe '), ('hashtag', '#Wetter')]
+    components = []
+    pos = 0
+    for match in TOKEN_RE.finditer(text):
+        #everything between the previous match and this one is plain text
+        if match.start() > pos:
+            components.append(('text', text[pos:match.start()]))
+        if match.group('url'):
+            #trailing sentence punctuation belongs to the text, not the URL
+            url = match.group('url').rstrip('.,!?;:')
+            components.append(('url', url))
+            trailing = match.group('url')[len(url):]
+            if trailing:
+                components.append(('text', trailing))
+        elif match.group('mention'):
+            components.append(('mention', match.group('mention')))
+        else:
+            components.append(('hashtag', match.group('hashtag')))
+        pos = match.end()
+    #whatever is left after the last match is plain text too
+    if pos < len(text):
+        components.append(('text', text[pos:]))
+    return components
+
+
+def add_mention(builder, mention_text):
+    #a real clickable mention facet needs the DID behind the handle,
+    #so ask bluesky to resolve it
+    try:
+        did = client.resolve_handle(mention_text.lstrip('@')).did
+        builder.mention(mention_text, did)
+    except Exception:
+        #not a resolvable handle (maybe a twitter-style @name), leave it as plain text
+        builder.text(mention_text)
+
+
+def add_components(builder, components):
+    #feed the pieces from extract_components into the TextBuilder, which
+    #assembles the post text plus the facets (the clickable parts)
+    for kind, value in components:
+        if kind == 'text':
+            builder.text(value)
+        elif kind == 'url':
+            #show the word 'link' instead of the (long) URL to save characters
+            builder.link('link', value)
+        elif kind == 'mention':
+            add_mention(builder, value)
+        elif kind == 'hashtag':
+            builder.tag(value, value.lstrip('#'))
+
+
+def get_profile_url(handle):
+    return 'https://bsky.app/profile/' + handle
+
+
+def split_in_half(text):
+    #find a space in the middle and break the text in two, for translations
+    #that don't fit in one 300-character post
+    words = text.split(' ')
+    halfway = round(len(words) / 2)
+    return [' '.join(words[:halfway]), ' '.join(words[halfway:])]
+
+
+def send_parts(header_pieces, text, embed=None, reply_to=None):
+    #assembles and sends one finished bluesky post (or two, if the text is
+    #too long for one). header_pieces describes the header as a list of
+    #('text', value) and ('handle', value) pairs - handles become links to
+    #their profiles. examples:
+    #  [('handle', 'tagesschau.de')]
+    #      -> "tagesschau.de: ..."
+    #  [('handle', 'zeit.de'), ('text', ' ↻ '), ('handle', 'tagesschau.de')]
+    #      -> "zeit.de ↻ tagesschau.de: ..."
+    #returns the API response of the last post sent, so a reply can be
+    #attached underneath it
+
+    header_length = sum(len(value) for kind, value in header_pieces)
+
+    #does everything fit in one post? if not, break the text in half
+    if header_length + len(': ') + len(text) <= MAX_POST_CHARS:
+        parts = [text]
+    else:
+        parts = split_in_half(text)
+
+    total = len(parts)
+    for n, part in enumerate(parts, 1):
+        #split posts get a counter in the header: "handle (1/2): ..."
+        counter = f' ({n}/{total})' if total > 1 else ''
+        header_tail = f'{counter}: '
+        #hard ceiling so a send can never fail on length: if a part is still
+        #too long, cut it off and end it with an ellipsis
+        allowed = MAX_POST_CHARS - header_length - len(header_tail)
+        if len(part) > allowed:
+            part = part[:allowed - 1] + '…'
+
+        #build the post: the header pieces, the counter, then the text
+        #with its facets
+        builder = client_utils.TextBuilder()
+        for kind, value in header_pieces:
+            if kind == 'handle':
+                builder.link(value, get_profile_url(value))
+            else:
+                builder.text(value)
+        builder.text(header_tail)
+        add_components(builder, extract_components(part))
+
+        #the embed goes on the last part of a split post
+        last_embed = embed if n == total else None
+        response = client.send_post(builder, embed=last_embed, reply_to=reply_to)
+
+    return response
+
+
+def get_quoted_record(post):
+    #if this post quotes another post ('repost with commentary'), dig the
+    #quoted post out of the embed view and return it (it carries the quoted
+    #text and author). returns None when there is nothing translatable.
+    embed = post.embed
+    if embed is None:
+        return None
+    #a quote with media attached wraps the record one level deeper
+    if isinstance(embed, models.AppBskyEmbedRecordWithMedia.View):
+        embed = embed.record
+    if not isinstance(embed, models.AppBskyEmbedRecord.View):
+        return None
+    record = embed.record
+    #the quoted post can be deleted, blocked, or detached - nothing to show then
+    if not isinstance(record, models.AppBskyEmbedRecord.ViewRecord):
+        return None
+    text = getattr(record.value, 'text', '') or ''
+    if not text.strip():
+        return None
+    return record
+
+
+def send_translated_post(post, translated_text, reposter_handle):
+    #sends the translation of one post:
+    #  authorhandle: translated text                  <- the account's own post
+    #  reposter ↻ authorhandle: translated text       <- repost by a list member
+    #with the original post embedded underneath as a quote, and - if the
+    #original itself quoted another post - a reply with that translation too.
+    #reposter_handle is None for an account's own posts
+
+    #embedding the original as a quote carries over images, video, link
+    #cards, and quoted posts, and doubles as the link back to the original
+    quote_embed = models.AppBskyEmbedRecord.Main(
+        record=models.ComAtprotoRepoStrongRef.Main(uri=post.uri, cid=post.cid)
+    )
+
+    #the header identifies who is involved: for a repost, both the list
+    #member who reposted it and the original author, linked to their profiles
+    if reposter_handle:
+        header = [('handle', reposter_handle), ('text', REPOST_MARKER), ('handle', post.author.handle)]
+    else:
+        header = [('handle', post.author.handle)]
+    response = send_parts(header, translated_text, embed=quote_embed)
+    log.info('posted translation of %s', post.uri)
+
+    #if the post quoted another post, translate the quoted text as well and
+    #hang it underneath the main translation as a reply:
+    #  ❝ quotedauthor: translated quoted text
+    quoted = get_quoted_record(post)
+    if quoted is not None:
+        try:
+            translated_quote = translate(quoted.value.text)
+            our_post_ref = models.ComAtprotoRepoStrongRef.Main(uri=response.uri, cid=response.cid)
+            reply_ref = models.AppBskyFeedPost.ReplyRef(parent=our_post_ref, root=our_post_ref)
+            quote_header = [('text', QUOTE_MARKER), ('handle', quoted.author.handle)]
+            send_parts(quote_header, translated_quote, reply_to=reply_ref)
+            log.info('added translation of the quoted post by %s', quoted.author.handle)
+        except Exception as e:
+            #the main post already went out, so failing here must not raise:
+            #that would re-send the main post next cycle as a duplicate.
+            #the quoted original is still visible in the embed, just untranslated
+            log.warning('could not add quoted-post translation under %s: %s', post.uri, e)
+
+
+#---------------- the per-account check ----------------
+
+#XRPC errors that mean an account can't be read right now (blocked the bot,
+#deactivated, suspended...): expected conditions, not bugs worth a traceback
+UNREACHABLE_ERRORS = ('BlockedByActor', 'AccountDeactivated', 'AccountTakedown', 'AccountSuspended')
+
+
+def process_account(did, account):
+    #this runs once per account per cycle: fetch their recent feed, figure
+    #out what's new, translate and send it, oldest first
+
+    feed = client.get_author_feed(actor=did, filter='posts_no_replies', limit=FEED_FETCH_LIMIT)
+    #getting here means the fetch worked - if the account was marked
+    #unreachable (see the main loop), it has recovered
+    if account.pop('unreachable', None):
+        log.info('%s is reachable again', account['handle'])
+    floor = parse_timestamp(account['floor'])
+
+    #-------- step 1: decide which feed items are new --------
+    new_posts = []
+    for item in feed.feed:
+        post = item.post
+        if item.reason is not None:
+            #a reason means the list member reposted someone else's post;
+            #the relevant time is when they reposted it, not when it was written
+            raw_time = getattr(item.reason, 'indexed_at', None)
+            if raw_time is None:
+                #a reason without a timestamp is something else (like a pin) - skip it
+                continue
+            is_repost = True
+        else:
+            #no reason = the account's own post. defensive check that the
+            #author really is the account we asked about
+            if post.author.did != did:
+                continue
+            raw_time = post.record.created_at
+            is_repost = False
+        try:
+            event_time = parse_timestamp(raw_time)
+        except ValueError:
+            log.warning('unparseable timestamp %r on %s, skipping', raw_time, post.uri)
+            continue
+        #skip anything older than the account's floor, and anything any list
+        #member already got posted (dedupe)
+        if event_time <= floor or uri_already_posted(post.uri):
+            continue
+        new_posts.append((event_time, post, is_repost))
+
+    if not new_posts:
+        return
+
+    #-------- step 2: oldest first, and apply the backlog cap --------
+    #oldest first, so translations appear in the order they were posted
+    new_posts.sort(key=lambda entry: entry[0])
+
+    if len(new_posts) > BACKLOG_CAP:
+        #too many piled up (probably downtime) - mark the oldest ones as done
+        #WITHOUT sending them, so the account doesn't get flooded
+        skipped = new_posts[:-BACKLOG_CAP]
+        log.warning('%s has %d new posts, skipping the oldest %d (backlog cap)',
+                    account['handle'], len(new_posts), len(skipped))
+        for event_time, post, is_repost in skipped:
+            mark_done(account, post.uri, event_time)
+        new_posts = new_posts[-BACKLOG_CAP:]
+
+    #-------- step 3: translate and send --------
+    for event_time, post, is_repost in new_posts:
+        log.info('new %s by %s: %s', 'repost' if is_repost else 'post', account['handle'], post.uri)
+        if post.record.text.strip():
+            #a TranslationError here aborts the account for this cycle;
+            #the post is not marked done, so it will be retried
+            translated = translate(post.record.text)
+        else:
+            #media-only post: nothing to translate, the quote embed carries the content
+            translated = ''
+        #for a repost, the list member (whose feed this is) is the reposter
+        send_translated_post(post, translated, account['handle'] if is_repost else None)
+        #only AFTER the send succeeded does the post count as done - and the
+        #state file is saved right away, so even a crash one second later
+        #can't cause a re-post
+        mark_done(account, post.uri, event_time)
+        save_state()
+
+
+#---------------- main loop ----------------
+
+def main():
+    bsky_login()
+    log.info('watching list %s with a %ds poll', LIST_RKEY, POLL_SECONDS)
+    while True:
+        #refresh the list membership first, in case accounts were added/removed
+        try:
+            sync_accounts()
+        except Exception as e:
+            log.error('could not sync list membership: %s', e)
+
+        #check every account. each one gets its own try/except so one broken
+        #account can't stop the others from being checked
+        for did, account in list(state['accounts'].items()):
+            try:
+                process_account(did, account)
+            except UnauthorizedError:
+                #the login session died mid-cycle - get a new one and move on
+                log.warning('session expired, logging in again')
+                state['session'] = None
+                bsky_login()
+            except BadRequestError as e:
+                error_name = getattr(e.response.content, 'error', '')
+                if error_name in UNREACHABLE_ERRORS:
+                    #warn once, then stay quiet until the account recovers
+                    if not account.get('unreachable'):
+                        log.warning('cannot read %s (%s), skipping until it recovers',
+                                    account['handle'], error_name)
+                        account['unreachable'] = True
+                else:
+                    log.error('error processing %s: %s\n%s', account['handle'], e, traceback.format_exc())
+            except TranslationError as e:
+                #both translators failed - the post was NOT marked done, so
+                #it gets picked up again next cycle
+                log.error('translation failed for %s, will retry next cycle: %s', account['handle'], e)
+            except Exception as e:
+                log.error('error processing %s: %s\n%s', account['handle'], e, traceback.format_exc())
+
+        save_state()
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == '__main__':
+    main()
