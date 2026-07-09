@@ -1,3 +1,10 @@
 secrets.py
 __pycache__
 google_api_quota_link.txt
+
+# generated at runtime by the bot
+state.json
+usage.csv
+
+# local dev venv
+bluesky_de/

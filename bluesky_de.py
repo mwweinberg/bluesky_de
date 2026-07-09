@@ -21,12 +21,13 @@ import re
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 from atproto import Client, client_utils, models
 from atproto_client.exceptions import BadRequestError, UnauthorizedError
+from zoneinfo import ZoneInfo
 
 #this is the local secrets file
 import secrets
@@ -67,6 +68,17 @@ QUOTE_MARKER = '❝ '
 #the state file lives next to this script, wherever the script is
 STATE_FILE = Path(__file__).resolve().parent / 'state.json'
 
+#the permanent usage log: one line per (UTC) day gets appended here, so
+#translation usage can be analyzed over time. format:
+#  date,google_chars,azure_chars,english_skipped_chars
+USAGE_FILE = Path(__file__).resolve().parent / 'usage.csv'
+
+#the free monthly character allowances, used only for the daily journal
+#line that shows where the month stands (the real enforcement lives in the
+#google cloud console quota cap and the azure F0 tier)
+GOOGLE_FREE_CHARS_PER_MONTH = 500_000
+AZURE_FREE_CHARS_PER_MONTH = 2_000_000
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
 #the atproto library logs every HTTP request at INFO, which drowns out the journal
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -105,6 +117,51 @@ def save_state():
 
 
 state = load_state()
+#state files from before usage tracking existed need the counters added
+state.setdefault('usage', {'date': datetime.now(timezone.utc).date().isoformat(),
+                           'google': 0, 'azure': 0, 'skipped': 0})
+
+
+def add_usage(service, characters):
+    #tally translated characters for the current (UTC) day.
+    #service is 'google', 'azure', or 'skipped' (already-english posts)
+    state['usage'][service] += characters
+
+
+def month_usage(month):
+    #sum the usage.csv rows for one month ('YYYY-MM') so the daily journal
+    #line can show where the month stands
+    totals = {'google': 0, 'azure': 0, 'skipped': 0}
+    if USAGE_FILE.exists():
+        for line in USAGE_FILE.read_text().splitlines()[1:]:
+            date, google_chars, azure_chars, skipped_chars = line.split(',')
+            if date.startswith(month):
+                totals['google'] += int(google_chars)
+                totals['azure'] += int(azure_chars)
+                totals['skipped'] += int(skipped_chars)
+    return totals
+
+
+def roll_usage():
+    #called every cycle, but only does something when the (UTC) date has
+    #changed: append the finished day's counts to usage.csv, log a summary,
+    #and start counting the new day from zero
+    usage = state['usage']
+    today = datetime.now(timezone.utc).date().isoformat()
+    if usage['date'] == today:
+        return
+    is_new_file = not USAGE_FILE.exists()
+    with USAGE_FILE.open('a') as f:
+        if is_new_file:
+            f.write('date,google_chars,azure_chars,english_skipped_chars\n')
+        f.write(f"{usage['date']},{usage['google']},{usage['azure']},{usage['skipped']}\n")
+    month = today[:7]
+    totals = month_usage(month)
+    log.info('usage on %s: google %d, azure %d, skipped %d chars. %s so far: google %d/%d, azure %d/%d',
+             usage['date'], usage['google'], usage['azure'], usage['skipped'],
+             month, totals['google'], GOOGLE_FREE_CHARS_PER_MONTH,
+             totals['azure'], AZURE_FREE_CHARS_PER_MONTH)
+    state['usage'] = {'date': today, 'google': 0, 'azure': 0, 'skipped': 0}
 
 
 def uri_already_posted(uri):
@@ -222,6 +279,12 @@ class TranslationError(Exception):
     pass
 
 
+class GoogleQuotaError(Exception):
+    #google's daily quota is used up. gets its own class so translate() can
+    #pause google until the reset instead of retrying it on every post
+    pass
+
+
 def translate_with_google(text):
     #google translate v2, called with proper URL parameters (the params dict)
     #so characters like &, #, and newlines in the post can't break the request
@@ -241,7 +304,12 @@ def translate_with_google(text):
     #google puts errors (like a used-up daily quota) in the json instead of
     #the translation - surface that as an exception so azure gets a turn
     if 'data' not in payload:
-        raise RuntimeError(payload.get('error', {}).get('message', f'HTTP {response.status_code}'))
+        message = payload.get('error', {}).get('message', f'HTTP {response.status_code}')
+        #quota problems come back as 403/429 - report those separately so
+        #google gets paused until the daily reset
+        if response.status_code in (403, 429) or 'quota' in message.lower() or 'limit' in message.lower():
+            raise GoogleQuotaError(message)
+        raise RuntimeError(message)
     return payload['data']['translations'][0]['translatedText']
 
 
@@ -265,17 +333,50 @@ def translate_with_azure(text):
     return response.json()[0]['translations'][0]['text']
 
 
-def translate(text):
-    #google first (free tier), azure as the fallback when google fails or
-    #runs out of quota for the day
-    try:
-        translated = translate_with_google(text)
-        log.info('translated with google')
-        return translated
-    except Exception as e:
-        log.warning('google translate failed (%s), trying azure', e)
+#while google's daily quota is used up, skip it until this time. kept in
+#memory only: after a restart the bot tries google once and re-pauses
+google_paused_until = None
+
+
+def next_pacific_midnight():
+    #google's daily quota resets at midnight US pacific time
+    now_pacific = datetime.now(ZoneInfo('America/Los_Angeles'))
+    return (now_pacific + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def translate(text, langs=None):
+    #langs is the language declaration from the post record (set by the app
+    #the author posted with), like ['de'] or ['en-US']
+    global google_paused_until
+
+    #posts that declare themselves english need no translation at all -
+    #skipping them costs nothing and saves quota on both services
+    if langs and all(lang.split('-')[0].lower() == 'en' for lang in langs):
+        add_usage('skipped', len(text))
+        log.info('already english, skipped translation')
+        return text
+
+    #google first (free tier), unless its daily quota is known to be used up
+    if google_paused_until is None or datetime.now(timezone.utc) >= google_paused_until:
+        if google_paused_until is not None:
+            log.info('google quota should have reset, trying google again')
+            google_paused_until = None
+        try:
+            translated = translate_with_google(text)
+            add_usage('google', len(text))
+            log.info('translated with google')
+            return translated
+        except GoogleQuotaError as e:
+            #stop asking google until the quota resets, instead of sending a
+            #doomed request (and logging a warning) for every post
+            google_paused_until = next_pacific_midnight()
+            log.warning('google quota exhausted (%s), using azure until %s',
+                        e, google_paused_until.strftime('%Y-%m-%d %H:%M %Z'))
+        except Exception as e:
+            log.warning('google translate failed (%s), trying azure', e)
     try:
         translated = translate_with_azure(text)
+        add_usage('azure', len(text))
         log.info('translated with azure')
         return translated
     except Exception as e:
@@ -465,7 +566,7 @@ def send_translated_post(post, translated_text, reposter_handle):
     quoted = get_quoted_record(post)
     if quoted is not None:
         try:
-            translated_quote = translate(quoted.value.text)
+            translated_quote = translate(quoted.value.text, getattr(quoted.value, 'langs', None))
             our_post_ref = models.ComAtprotoRepoStrongRef.Main(uri=response.uri, cid=response.cid)
             reply_ref = models.AppBskyFeedPost.ReplyRef(parent=our_post_ref, root=our_post_ref)
             quote_header = [('text', QUOTE_MARKER), ('handle', quoted.author.handle)]
@@ -549,7 +650,7 @@ def process_account(did, account):
         if post.record.text.strip():
             #a TranslationError here aborts the account for this cycle;
             #the post is not marked done, so it will be retried
-            translated = translate(post.record.text)
+            translated = translate(post.record.text, post.record.langs)
         else:
             #media-only post: nothing to translate, the quote embed carries the content
             translated = ''
@@ -568,6 +669,10 @@ def main():
     bsky_login()
     log.info('watching list %s with a %ds poll', LIST_RKEY, POLL_SECONDS)
     while True:
+        #when a new (UTC) day has started, write yesterday's translation
+        #counts to usage.csv and log the month's running totals
+        roll_usage()
+
         #refresh the list membership first, in case accounts were added/removed
         try:
             sync_accounts()
