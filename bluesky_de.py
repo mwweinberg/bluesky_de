@@ -475,8 +475,8 @@ def send_parts(header_pieces, text, embed=None, reply_to=None):
     #      -> "tagesschau.de: ..."
     #  [('handle', 'zeit.de'), ('text', ' ↻ '), ('handle', 'tagesschau.de')]
     #      -> "zeit.de ↻ tagesschau.de: ..."
-    #returns the API response of the last post sent, so a reply can be
-    #attached underneath it
+    #returns the API response of the post carrying the embed (the last part),
+    #so a reply can be attached underneath it
 
     header_length = sum(len(value) for kind, value in header_pieces)
 
@@ -487,7 +487,9 @@ def send_parts(header_pieces, text, embed=None, reply_to=None):
         parts = split_in_half(text)
 
     total = len(parts)
-    for n, part in enumerate(parts, 1):
+    #split posts go out last part first, so that in the feed (newest on top)
+    #the (1/2) post sits above the (2/2) post and reads top to bottom
+    for n, part in reversed(list(enumerate(parts, 1))):
         #split posts get a counter in the header: "handle (1/2): ..."
         counter = f' ({n}/{total})' if total > 1 else ''
         header_tail = f'{counter}: '
@@ -510,7 +512,9 @@ def send_parts(header_pieces, text, embed=None, reply_to=None):
 
         #the embed goes on the last part of a split post
         last_embed = embed if n == total else None
-        response = client.send_post(builder, embed=last_embed, reply_to=reply_to)
+        sent = client.send_post(builder, embed=last_embed, reply_to=reply_to)
+        if n == total:
+            response = sent
 
     return response
 
